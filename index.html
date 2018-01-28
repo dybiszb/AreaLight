@@ -1,0 +1,670 @@
+<html>
+
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=windows-1252">
+    <style>
+        body {
+            margin: 0;
+            font-family: monospace;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #c {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        #shaderJP2 {
+            width: 30%;
+            height: 100%;
+            overflow: auto;
+            top:0px;
+            left: 0px;
+            margin: 0px;
+            position: absolute;
+            background: rgba(29, 29, 29, 0.35);
+            color: white;
+        }
+    </style>
+    <link rel="shortcut icon" href="">
+</head>
+
+<body>
+    <canvas id="c" width="624" height="710"></canvas>
+    <textarea id="shaderJP2"></textarea>
+    <script src="externals/twgl/4.x/twgl-full.min.js"></script>
+    <script src="externals/stats_js/build/stats.min.js"></script>
+    <script src="externals/dat.gui-master/build/dat.gui.js"></script>
+    <script src="js/io.js"></script>
+</body>
+
+<script>
+// =============================================================================
+// Shaders
+// =============================================================================
+
+const skyboxVS = `
+// ============================================
+// S K Y B O X  V E R T E X   S H A D E R
+// ============================================
+// --------------------------------------------
+
+attribute vec4 a_position;
+
+varying vec3 v_texCoords;
+varying vec3 v_position;
+
+uniform mat4 u_model;
+uniform mat4 u_view;
+uniform mat4 u_projection;
+
+void main() {
+  v_texCoords = vec3(a_position);
+  vec4 finalPosition = u_projection * mat4(mat3(u_view)) * u_model * a_position;
+  v_position = vec3(finalPosition);
+  gl_Position = finalPosition;
+}
+`;
+
+const skyboxFS = `
+// ============================================
+// S K Y B O X  F R A G M E N T S H A D E R
+// ============================================
+// --------------------------------------------
+
+precision mediump float;
+
+varying vec3 v_texCoords;
+varying vec3 v_position;
+
+uniform samplerCube u_skybox;
+uniform float u_gammaCorrection;
+
+void main() {
+   vec3 flippedY = v_texCoords;
+   vec3 color = textureCube(u_skybox, flippedY).rgb;
+   gl_FragColor = vec4(pow(color, vec3(1.0/u_gammaCorrection)), 1.0);
+}
+`;
+
+
+
+    const basicVS =
+        `
+// ============================================
+// D E F A U L T  V E R T E X   S H A D E R
+// ============================================
+// --------------------------------------------
+
+attribute vec4 a_position;
+
+uniform mat4 u_model;
+uniform mat4 u_view;
+uniform mat4 u_projection;
+
+void main() {
+  gl_Position = u_projection * u_view * u_model * a_position;
+}
+`;
+
+    const basicFS =
+        `
+// ============================================
+// D E F A U L T  F R A G M E N T  S H A D E R
+// ============================================
+// --------------------------------------------
+
+precision mediump float;
+uniform vec3 u_color;
+void main() {
+   gl_FragColor = vec4(u_color / 255.0, 1.0);
+}
+`;
+
+    const shadedVS =
+        `
+// ============================================
+// S U R F A C E  V E R T E X   S H A D E R
+// ============================================
+// --------------------------------------------
+
+attribute vec4 a_position;
+
+uniform sampler2D u_heightmap;
+uniform float u_heightmapSizeX;
+uniform float u_heightmapSizeY;
+
+uniform mat4 u_model;
+uniform mat4 u_view;
+uniform mat4 u_projection;
+
+varying vec3 v_worldSpaceFragmentPosition;
+varying vec2 v_texCoords;
+
+vec2 getTerrainTexCoord() {
+    vec3 positionXYZ = vec3(a_position);
+    vec2 positionUV = vec2(positionXYZ.x, positionXYZ.z);
+    vec2 normalizationStep1 =
+          vec2(u_heightmapSizeX / 2.0,
+               u_heightmapSizeY / 2.0);
+    positionUV += normalizationStep1;
+    positionUV.x /= u_heightmapSizeX;
+    positionUV.y /= u_heightmapSizeY;
+    return positionUV;
+}
+
+void main() {
+    vec4 worldSpacePosition =  u_model * a_position;
+
+    // Apply heightmap.
+    vec2 positionUV = getTerrainTexCoord();
+    //worldSpacePosition.y = 1.0 * texture2D(u_heightmap, positionUV).r;
+
+    // Pass data to fragment shader.
+    v_worldSpaceFragmentPosition = vec3(worldSpacePosition);
+    v_texCoords = positionUV;
+
+    gl_Position = u_projection * u_view * worldSpacePosition;
+}
+`;
+
+    const shadedFS =
+      `
+// ============================================
+// S U R F A C E  F R A G M E N T  S H A D E R
+// ============================================
+// --------------------------------------------
+
+precision mediump float;
+uniform vec3 u_color;
+uniform vec3 u_viewPosition;
+
+uniform vec3 u_areaLightVertexA;
+uniform vec3 u_areaLightVertexB;
+uniform vec3 u_areaLightVertexC;
+uniform vec3 u_areaLightVertexD;
+uniform vec3 u_areaLightColor;
+uniform vec3 u_areaLightNormal;
+uniform mat4 u_areaLightModel;
+uniform vec3 u_areaLightTranslation;
+
+uniform sampler2D u_diffusemap;
+uniform sampler2D u_normalmap;
+uniform sampler2D u_roughnessmap;
+
+uniform vec3 u_areaLightAmbient;
+uniform vec3 u_areaLightSpecular;
+uniform vec3 u_areaLightDiffuse;
+
+uniform float u_gammaCorrection;
+uniform float u_linearConstant;
+uniform float u_quadraticConstant;
+uniform float u_areaLightShininess;
+
+varying vec3 v_worldSpaceFragmentPosition;
+varying vec2 v_texCoords;
+
+vec3 mapPointOntoPlane(vec3 planeN, vec3 planeD, vec3 point)
+{
+    vec3 N = normalize(planeN);
+    vec3 fromPlaneOriginToPoint = point - planeD;
+    float distanceAlongNormal = dot(N, fromPlaneOriginToPoint);
+    vec3 distanceAlongNormalAsVector = distanceAlongNormal * N;
+
+    return point - distanceAlongNormalAsVector;
+}
+
+bool isPositionShaded(vec3 fragPos, vec3 planeN, vec3 planePos)
+{
+    vec3 fromPlaneToFragment = fragPos - planePos;
+    return dot(fromPlaneToFragment, planeN) > 0.0;
+}
+
+float calculateAttenuation(float distance, float K_l, float K_q)
+{
+    return  1.0 / (1.0 + K_l * distance + K_q * distance * distance);
+}
+
+vec2 mapTo2DRectangleSpace(vec3 vA, vec3 vB, vec3 vC, vec3 mappedOntoPlane)
+{
+  vec3 from2DOrigin = mappedOntoPlane - vA;
+
+    // Create 2D space where vertex A is the origin and map the point on the
+    // plane onto it.
+    vec3 normalizedUp = normalize(vC - vA);
+    vec3 normalizedRight = normalize(vB - vA);
+
+    return vec2(dot(normalizedRight, from2DOrigin), dot(normalizedUp, from2DOrigin));
+}
+vec3 calculateNearestPointOnRectangle(vec3 vA,
+                                      vec3 vB,
+                                      vec3 vC,
+                                      vec2 mappedTo2DRectangleSpace)
+{
+    // Calculate width and height of area light.
+    float width = distance(vA, vB);
+    float height = distance(vA, vC);
+
+    // Create 2D space where vertex A is the origin and map the point on the
+    // plane onto it.
+    vec3 normalizedUp = normalize(vC - vA);
+    vec3 normalizedRight = normalize(vB - vA);
+
+    // By clamping previously calculated
+    // values to the rectangle's dimension we can obtain closest point in
+    // 2D space and then map it back into the scene's world space.
+    float clamppedX = clamp(mappedTo2DRectangleSpace.x, 0.0, width);
+    float clamppedY = clamp(mappedTo2DRectangleSpace.y, 0.0, height);
+
+    return vA + normalizedRight * clamppedX + normalizedUp * clamppedY;
+}
+
+vec3 intersectVectorWithPlane(vec3 vector, vec3 fragPos, vec3 planeN, vec3 D)
+{
+    float nominator = dot(D - fragPos, planeN);
+    float denominator = dot(vector, planeN);
+
+    if(denominator == 0.0) return vec3(0.0, 0.0, 0.0);
+
+    float d = nominator / denominator;
+    return fragPos + d * vector;
+}
+
+vec4 calculateAreaLight(vec3 lightPos, vec3 fragPos, vec3 viewDir, vec3 fragN, bool isSpecular)
+{
+    vec3 ambientStrength = normalize(u_areaLightAmbient);
+    vec3 diffuseStrength  = normalize(u_areaLightDiffuse);
+    vec3 specularStrength = normalize(u_areaLightSpecular);
+
+    vec3 fromFragToLight = normalize(lightPos - fragPos);
+    vec3 reflection = reflect(-fromFragToLight, fragN);
+
+    float lambertianFactor = max(0.0, dot(fragN, fromFragToLight));
+    float specularFactor = pow(max(dot(viewDir, reflection), 0.0), u_areaLightShininess);
+
+    vec3 diffuseColor = texture2D(u_diffusemap, v_texCoords).rgb;
+    float roughness = texture2D(u_roughnessmap, v_texCoords).r;
+
+    vec3 ambientComponent = ambientStrength * diffuseColor;
+    vec3 diffuseComponent = diffuseStrength * lambertianFactor * diffuseColor;
+    vec3 specularComponent = specularStrength * specularFactor * roughness;
+
+    float distanceToLight = distance(lightPos, fragPos);
+    float attenuation = calculateAttenuation(distanceToLight,
+                                     u_linearConstant,
+                                     u_quadraticConstant);
+    diffuseComponent  *= attenuation;
+    specularComponent *= attenuation;
+
+    // vec3 phongColor = ambientComponent + diffuseComponent + (isSpecular ? specularComponent : vec3(0.0, 0.0, 0.0));
+    vec3 phongColor = ambientComponent + diffuseComponent + specularComponent;
+    vec3 gammaCorrectedColor = pow(phongColor, vec3(1.0/u_gammaCorrection));
+
+    return vec4(gammaCorrectedColor, 1.0);
+}
+
+void main() {
+    // I assume that no non-uniform scaling will not happen, hence inverting
+    // and transposing model matrix (normal matrix) is not required.
+    vec3 correctAreaLightNormal = mat3(u_areaLightModel) * u_areaLightNormal;
+
+    // Terrain is assumed to not be moved. Only scaled uniformly, hence
+    // the assumption that sampled normals are correctly
+    // oriented.
+    // vec3 sampledNormal = texture2D(u_normalmap, v_texCoords).rgb;
+
+    // dat.gui process RGB colors in <0, 255> range.
+    vec3 areaLightColor = normalize(u_areaLightColor);
+    vec3 terrainColor   = texture2D(u_diffusemap, v_texCoords).rgb;
+
+    // Transform area light vertices to World Space.
+    vec3 vA = vec3(mat4(u_areaLightModel) * vec4(u_areaLightVertexA, 1.0));
+    vec3 vB = vec3(mat4(u_areaLightModel) * vec4(u_areaLightVertexB, 1.0));
+    vec3 vC = vec3(mat4(u_areaLightModel) * vec4(u_areaLightVertexC, 1.0));
+    vec3 vD = vec3(mat4(u_areaLightModel) * vec4(u_areaLightVertexD, 1.0));
+
+    vec3 mappedOntoPlane = mapPointOntoPlane(correctAreaLightNormal,
+                                        u_areaLightTranslation,
+                                        v_worldSpaceFragmentPosition);
+    vec2 mappedOnto2D = mapTo2DRectangleSpace(vA, vB, vC, mappedOntoPlane);
+    vec3 nearestPoint = calculateNearestPointOnRectangle(vA, vB, vC, mappedOnto2D);
+
+    // vec3 N = normalize(sampledNormal);
+    // For testing purposes, all normals assumed to be pointing upward.
+    vec3 N = vec3(0.0, 1.0, 0.0);
+    vec3 viewDir = normalize(u_viewPosition - v_worldSpaceFragmentPosition);
+    vec3 reflectedViewDir = reflect(-viewDir, N);
+
+
+    // Additional check for specular component to occur.
+    vec3 inter = intersectVectorWithPlane(reflectedViewDir, v_worldSpaceFragmentPosition, correctAreaLightNormal, u_areaLightTranslation);
+    vec2 specular2D = mapTo2DRectangleSpace(vA, vB, vC, inter);
+    bool isSpecular = specular2D.x > 0.0 && specular2D.x <= distance(vA, vB)
+                      && specular2D.y > 0.0 && specular2D.y < distance(vA, vC);
+
+
+    gl_FragColor = calculateAreaLight(nearestPoint,
+                                      v_worldSpaceFragmentPosition,
+                                      viewDir,
+                                      N,
+                                      isSpecular);
+}
+`;
+
+// =============================================================================
+// TWGL specific globals.
+// =============================================================================
+const m4 = twgl.m4;
+const v3 = twgl.v3;
+const canvas = document.querySelector("#c");
+const shaderCodeBox = document.querySelector('#shaderJP2');
+const shaderCode = document.createTextNode(`${shadedVS}\n${shadedFS}\n${skyboxVS}\n${skyboxFS}\n${basicVS}\n${basicFS}`);
+shaderCodeBox.appendChild(shaderCode);
+
+const gl = canvas.getContext("webgl");
+twgl.setDefaults({
+    attribPrefix: "a_"
+});
+
+// =============================================================================
+//  Steering setup.
+// =============================================================================
+document.onkeydown = IO.handleKeyDown;
+document.onkeyup = IO.handleKeyUp;
+document.onmouseup = IO.handleMouseUp;
+document.onmousemove = IO.handleMouseMove;
+canvas.onmousedown = IO.handleMouseDown;
+
+// =============================================================================
+// Scene setup.
+// =============================================================================
+var ApplicationSettings = function () {
+    this.areaLightAmbient = [30.0, 30.0, 30.0]
+    this.areaLightDiffuse = [0.0, 180.0, 0.0],
+    this.areaLightSpecular = [30.0, 30.0, 30.0]
+    this.areaLightTranslation = [0.0, 0.5, 0.0];
+    this.areaLightRotationX = 0.0;
+    this.areaLightRotationY = 0.0;
+    this.areaLightRotationZ = 0.0;
+    this.areaLightTranslationX = 0.0;
+    this.areaLightTranslationY = 2.3;
+    this.areaLightTranslationZ = 0.0;
+    this.terrainScale = 0.02;
+    this.gammaCorrection = 0.5;
+    this.linearConstant = 0.07;
+    this.quadraticConstant = 0.09;
+    this.shininess = 31.0;
+};
+var applicationSettings = new ApplicationSettings();
+
+var AL_width = 3.0;
+var AL_height = 1.0;
+var AL_translation = [0.0, 0.5, 0.0];
+
+var AL_vA = v3.create(0.0, 0.0, 0.0);
+var AL_vB = v3.create(0.0, 0.0, 0.0);
+var AL_vC = v3.create(0.0, 0.0, 0.0);
+var AL_vD = v3.create(0.0, 0.0, 0.0);
+var AL_N = v3.create(0.0, -1.0, 0.0);
+
+var PLANE_width = 20.0;
+var PLANE_height = 20.0;
+
+SpectatorCamera.__data.m_pitch = -24.5;
+SpectatorCamera.__data.m_yaw = -57;
+SpectatorCamera.__data.m_position = [13.6, 6.83, -8.4];
+SpectatorCamera.__data.m_angularSpeed = 0.2;
+SpectatorCamera.__data.m_movementSpeed = 0.1;
+
+// =======================================================================
+// Initialize statistics panel.
+// =======================================================================
+var statsFPS = new Stats();
+statsFPS.showPanel(0); // 0: fps, 1: ms, 2: mb, 3+: custom
+statsFPS.dom.style.cssText = 'position:absolute;bottom:0px;right:160px;';
+document.body.appendChild(statsFPS.dom);
+
+var statsMBs = new Stats();
+statsMBs.showPanel(2); // Panel 1 = ms
+statsMBs.dom.style.cssText = 'position:absolute;bottom:0px;right:80px;';
+document.body.appendChild(statsMBs.dom);
+
+var statsMs = new Stats();
+statsMs.showPanel(1); // Panel 1 = ms
+statsMs.dom.style.cssText = 'position:absolute;bottom:0px;right:0px;';
+document.body.appendChild(statsMs.dom);
+
+// =============================================================================
+// Textures
+// =============================================================================
+const terrainSizeX = 1000.0;
+const terrainSizeY = 1000.0;
+const terrainSubdivisionsX = 200.0;
+const terrainSubdivisionsY = 200.0;
+
+const g_textures = twgl.createTextures(gl, {
+  skybox: {
+    target: gl.TEXTURE_CUBE_MAP,
+    src: [
+      './res/skybox/grimmnight_lf.jpg',
+      './res/skybox/grimmnight_rt.jpg',
+      './res/skybox/grimmnight_up.jpg',
+      './res/skybox/grimmnight_dn.jpg',
+      './res/skybox/grimmnight_ft.jpg',
+      './res/skybox/grimmnight_bk.jpg',
+    ],
+  },
+  heightmap: {
+    src: `./res/terrain/heightmap.jpg`,
+  },
+  heightmap_diffuse: {
+    src: `./res/terrain/diffusemap.jpg`,
+  },
+  heightmap_normal: {
+    src: `./res/terrain/normalmap.jpg`,
+  },
+  heightmap_roughness: {
+    src: `./res/terrain/roughnessmap.jpg`,
+  },
+});
+
+// =============================================================================
+//  MVP matrices setup.
+// =============================================================================
+const projection = m4.identity();
+let view = m4.identity();
+var areaLightModel = m4.identity();
+const planeModel = m4.identity();
+let skyboxModel = m4.identity();
+
+// =============================================================================
+//  Load shaders.
+// =============================================================================
+const areaLightProgram = twgl.createProgramInfo(gl, [basicVS, basicFS]);
+const skyboxProgram = twgl.createProgramInfo(gl, [skyboxVS, skyboxFS]);
+const planeProgram = twgl.createProgramInfo(gl, [shadedVS, shadedFS]);
+
+// =============================================================================
+//  Load geometry.
+// =============================================================================
+const areaLightBufferI = twgl.primitives.createPlaneBufferInfo(gl, AL_width,
+    AL_height);
+// const planeBufferI = twgl.primitives.createPlaneBufferInfo(gl, PLANE_width,
+//     PLANE_height);
+
+const planeBufferI = twgl.primitives.createPlaneBufferInfo(gl, terrainSizeX, terrainSizeY, terrainSubdivisionsX, terrainSubdivisionsY);
+const skyboxBufferI = twgl.primitives.createCubeBufferInfo(gl, 2048);
+
+// =============================================================================
+//  Load uniforms.
+// =============================================================================
+const areaLightUniforms = {
+    u_model: areaLightModel,
+    u_view: view,
+    u_projection: projection,
+    u_color: applicationSettings.areaLightDiffuse
+};
+
+const planeUniforms = {
+    u_heightmap: g_textures.heightmap,
+    u_heightmapSizeX : terrainSizeX,
+    u_heightmapSizeY : terrainSizeY,
+    u_diffusemap: g_textures.heightmap_diffuse,
+    u_normalmap : g_textures.heightmap_normal,
+    u_roughnessmap : g_textures.heightmap_roughness,
+    u_model: planeModel,
+    u_view: view,
+    u_projection: projection,
+    u_color: [0.4, 0.4, 0.4],
+    u_areaLightVertexA: AL_vA,
+    u_areaLightVertexB: AL_vB,
+    u_areaLightVertexC: AL_vC,
+    u_areaLightVertexD: AL_vD,
+    u_areaLightNormal: AL_N,
+    u_areaLightColor: applicationSettings.areaLightDiffuse,
+    u_areaLightModel: areaLightModel,
+    u_areaLightTranslation: AL_translation,
+    u_viewPosition: SpectatorCamera.__data.m_position,
+    u_gammaCorrection: applicationSettings.gammaCorrection,
+    u_linearConstant: applicationSettings.linearConstant,
+    u_quadraticConstant: applicationSettings.quadraticConstant,
+    u_areaLightAmbient: applicationSettings.areaLightAmbient,
+    u_areaLightDiffuse: applicationSettings.areaLightDiffuse,
+    u_areaLightSpecular: applicationSettings.areaLightSpecular,
+    u_areaLightShininess: applicationSettings.shininess,
+};
+
+const skyboxUniforms = {
+  u_skybox: g_textures.skybox,
+  u_model : skyboxModel,
+  u_view : view,
+  u_projection : projection,
+  u_gammaCorrection: applicationSettings.gammaCorrection,
+};
+
+// =============================================================================
+//  Utilities.
+// =============================================================================
+const updateViewMatrix = function () {
+    SpectatorCamera.getViewMatrix(view);
+    m4.inverse(view, view);
+}
+
+const updateAreaLightOrientation = function () {
+    // Update model matrix.
+    var XrotationRads = applicationSettings.areaLightRotationX * Math.PI / 180.0;
+    var YrotationRads = applicationSettings.areaLightRotationY * Math.PI / 180.0;
+    var ZrotationRads = applicationSettings.areaLightRotationZ * Math.PI / 180.0;
+    var modelMatrix = m4.identity();
+    var translation = [applicationSettings.areaLightTranslationX,
+        applicationSettings.areaLightTranslationY,
+        applicationSettings.areaLightTranslationZ
+    ];
+
+    m4.translate(modelMatrix, translation, modelMatrix);
+    m4.axisRotate(modelMatrix, [1.0, 0.0, 0.0], XrotationRads, modelMatrix);
+    m4.axisRotate(modelMatrix, [0.0, 1.0, 0.0], YrotationRads, modelMatrix);
+    m4.axisRotate(modelMatrix, [0.0, 0.0, 1.0], ZrotationRads, areaLightModel);
+
+    m4.scale(m4.identity(), [applicationSettings.terrainScale, applicationSettings.terrainScale, applicationSettings.terrainScale], planeModel);
+
+    let halfALWidth = AL_width / 2.0;
+    let halfALHeight = AL_height / 2.0;
+    planeUniforms.u_areaLightVertexA = v3.create(-halfALWidth, 0.0, -halfALHeight);
+    planeUniforms.u_areaLightVertexB = v3.create(halfALWidth, 0.0, -halfALHeight);
+    planeUniforms.u_areaLightVertexC = v3.create(-halfALWidth, 0.0, halfALHeight);
+    planeUniforms.u_areaLightVertexD = v3.create(halfALWidth, 0.0, halfALHeight);
+
+    planeUniforms.u_areaLightColor = applicationSettings.areaLightDiffuse;
+    planeUniforms.u_viewPosition = SpectatorCamera.__data.m_position;
+    planeUniforms.u_gammaCorrection = applicationSettings.gammaCorrection;
+    planeUniforms.u_linearConstant = applicationSettings.linearConstant;
+    planeUniforms.u_quadraticConstant = applicationSettings.quadraticConstant;
+    planeUniforms.u_areaLightAmbient = applicationSettings.areaLightAmbient;
+    planeUniforms.u_areaLightDiffuse = applicationSettings.areaLightDiffuse;
+    planeUniforms.u_areaLightSpecular = applicationSettings.areaLightSpecular;
+    skyboxUniforms.u_gammaCorrection = applicationSettings.gammaCorrection;
+    planeUniforms.u_areaLightShininess = applicationSettings.shininess;
+}
+
+const renderAreaLight = function () {
+    gl.useProgram(areaLightProgram.program);
+    twgl.setUniforms(areaLightProgram, areaLightUniforms);
+    twgl.setBuffersAndAttributes(gl, areaLightProgram, areaLightBufferI);
+    twgl.drawBufferInfo(gl, areaLightBufferI);
+}
+
+const renderPlane = function () {
+    gl.useProgram(planeProgram.program);
+    twgl.setUniforms(planeProgram, planeUniforms);
+    twgl.setBuffersAndAttributes(gl, planeProgram, planeBufferI);
+    twgl.drawBufferInfo(gl, planeBufferI);
+}
+
+const renderSkybox = function() {
+    //m4.rotateY(skyboxModel, g_dt / 200000.0, skyboxModel);
+    gl.depthMask(false);
+    gl.useProgram(skyboxProgram.program);
+    twgl.setUniforms(skyboxProgram, skyboxUniforms);
+    twgl.setBuffersAndAttributes(gl, skyboxProgram, skyboxBufferI);
+    twgl.drawBufferInfo(gl, skyboxBufferI);
+    gl.depthMask(true);
+}
+
+// =============================================================================
+// GUI
+// =============================================================================
+var gui = new dat.GUI({
+    width: 350
+});
+var fAreaLight = gui.addFolder('Scene Properties');
+fAreaLight.addColor(applicationSettings, 'areaLightAmbient');
+fAreaLight.addColor(applicationSettings, 'areaLightDiffuse');
+fAreaLight.addColor(applicationSettings, 'areaLightSpecular');
+fAreaLight.add(applicationSettings, 'areaLightRotationX', 0.0, 90.0);
+fAreaLight.add(applicationSettings, 'areaLightRotationY', 0.0, 90.0);
+fAreaLight.add(applicationSettings, 'areaLightRotationZ', -180.0, 180.0);
+fAreaLight.add(applicationSettings, 'areaLightTranslationX', -5.0, 5.0);
+fAreaLight.add(applicationSettings, 'areaLightTranslationY', -5.0, 5.0);
+fAreaLight.add(applicationSettings, 'areaLightTranslationZ', -5.0, 5.0);
+fAreaLight.add(applicationSettings, 'terrainScale', 0.001, 0.5);
+fAreaLight.add(applicationSettings, 'gammaCorrection', 0.0, 5.0);
+fAreaLight.add(applicationSettings, 'linearConstant', 0.0, 1.0);
+fAreaLight.add(applicationSettings, 'quadraticConstant', 0.0, 2.0);
+fAreaLight.add(applicationSettings, 'shininess', 1.0, 100.0);
+fAreaLight.open();
+
+// =============================================================================
+//  Rendering function.
+// =============================================================================
+function render(time) {
+    statsFPS.begin();
+    statsMBs.begin();
+    statsMs.begin();
+    IO.handleKeyboard();
+    updateViewMatrix();
+    updateAreaLightOrientation();
+
+    twgl.resizeCanvasToDisplaySize(gl.canvas);
+    m4.perspective(45 * Math.PI / 180, gl.canvas.clientWidth / gl.canvas.clientHeight, 0.01, 5000, projection);
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    renderSkybox();
+    renderAreaLight();
+    renderPlane();
+
+    statsMs.end();
+    statsMBs.end();
+    statsFPS.end();
+    requestAnimationFrame(render);
+}
+
+requestAnimationFrame(render);
+</script>
+
+</html>
